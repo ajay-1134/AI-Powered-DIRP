@@ -1,0 +1,4 @@
+.git
+scripts
+*.md
+.gitignore

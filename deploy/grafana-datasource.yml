@@ -1,0 +1,9 @@
+# Auto-provision the Prometheus data source so Grafana is usable immediately at
+# http://localhost:3000 (anonymous admin is enabled for the demo).
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

@@ -1,0 +1,10 @@
+# Binaries / build output
+/bin/
+dirp
+*.exe
+
+# Local env
+.env
+
+# OS
+.DS_Store

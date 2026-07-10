@@ -1,0 +1,17 @@
+# Prometheus scrape config for the DIRP demo. This is the "real Prometheus" in
+# the stack: it scrapes the same /metrics endpoints the platform ingests from,
+# so you can inspect raw series in the Prometheus UI (http://localhost:9090) or
+# Grafana while an incident unfolds.
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: dirp-services
+    static_configs:
+      - targets:
+          - user:8081
+          - order:8082
+          - payment:8083
+          - ledger:8084
+          - notification:8085
