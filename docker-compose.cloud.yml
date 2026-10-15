@@ -1,0 +1,70 @@
+# Slim stack for a small VM: pull the pre-built image, in-memory store.
+# Does not start TimescaleDB, Prometheus, or Grafana.
+#
+#   docker compose -f docker-compose.cloud.yml pull
+#   docker compose -f docker-compose.cloud.yml up -d
+#   ./scripts/demo.sh
+
+x-dirp: &dirp
+  image: ghcr.io/ajay-1134/ai-powered-dirp:latest
+  restart: unless-stopped
+
+services:
+  notification:
+    <<: *dirp
+    entrypoint: ["/bin/notification"]
+    environment:
+      NOTIFICATION_ADDR: ":8085"
+      OTLP_ENDPOINT: "platform:4317"
+
+  ledger:
+    <<: *dirp
+    entrypoint: ["/bin/ledger"]
+    environment:
+      LEDGER_ADDR: ":8084"
+      NOTIFICATION_URL: "http://notification:8085"
+      OTLP_ENDPOINT: "platform:4317"
+    depends_on: [notification]
+
+  payment:
+    <<: *dirp
+    entrypoint: ["/bin/payment"]
+    ports:
+      - "8083:8083"
+    environment:
+      PAYMENT_ADDR: ":8083"
+      LEDGER_URL: "http://ledger:8084"
+      PAYMENT_DB_MAX_CONNS: "10"
+      OTLP_ENDPOINT: "platform:4317"
+    depends_on: [ledger]
+
+  order:
+    <<: *dirp
+    entrypoint: ["/bin/order"]
+    environment:
+      ORDER_ADDR: ":8082"
+      PAYMENT_URL: "http://payment:8083"
+      OTLP_ENDPOINT: "platform:4317"
+    depends_on: [payment]
+
+  user:
+    <<: *dirp
+    entrypoint: ["/bin/user"]
+    environment:
+      USER_ADDR: ":8081"
+      ORDER_URL: "http://order:8082"
+      OTLP_ENDPOINT: "platform:4317"
+      LOAD_RPS: "12"
+    depends_on: [order]
+
+  platform:
+    <<: *dirp
+    entrypoint: ["/bin/platform"]
+    ports:
+      - "8080:8080"
+    environment:
+      PLATFORM_ADDR: ":8080"
+      PLATFORM_OTLP_ADDR: ":4317"
+      SCRAPE_TARGETS: "user-service=http://user:8081/metrics,order-service=http://order:8082/metrics,payment-service=http://payment:8083/metrics,ledger-service=http://ledger:8084/metrics,notification-service=http://notification:8085/metrics"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    depends_on: [user, order, payment, ledger, notification]
