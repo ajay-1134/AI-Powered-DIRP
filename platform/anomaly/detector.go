@@ -48,6 +48,17 @@ type Config struct {
 	// ErrorRateFloor is an absolute error-rate gate: below it we never alarm,
 	// regardless of z-score, so a jump from 0 to 2 errors doesn't page anyone.
 	ErrorRateFloor float64
+	// LatencyFloor is the absolute p99 gate, in seconds, and the latency
+	// equivalent of ErrorRateFloor: below it we never alarm however extreme the
+	// z-score. It exists because p99 is derived from histogram buckets and is
+	// therefore quantized: a healthy service sitting on the 10ms bound that
+	// drifts to the next bound (25ms) registers as a 2.5x jump, and because a
+	// steady signal has near-zero variance the z-score is effectively infinite.
+	// Both statistical gates clear on a system that is completely healthy. Real
+	// dependency stalls here surface in the hundreds of milliseconds to seconds
+	// (the downstream client times out at 3s), so this cleanly separates genuine
+	// stalls from bucket quantization noise.
+	LatencyFloor float64
 	// DBUtilThreshold is the pool-utilization fraction considered saturated.
 	DBUtilThreshold float64
 }
@@ -59,6 +70,7 @@ func DefaultConfig() Config {
 		Alpha:           0.2,
 		ZThreshold:      3.0,
 		ErrorRateFloor:  0.05,
+		LatencyFloor:    0.25,
 		DBUtilThreshold: 0.9,
 	}
 }
@@ -96,12 +108,51 @@ func (d *Detector) Observe(s model.ServiceSnapshot) []Anomaly {
 
 	var out []Anomaly
 
-	// During warmup, only learn; don't detect.
+	// During warmup, only learn; don't detect. Intervals with no traffic are not
+	// learned from either (see the no-traffic note below), so warmup measures
+	// five samples of real behavior rather than five scrapes of silence.
 	if b.n < d.cfg.Warmup {
-		b.errorRate.update(s.ErrorRate)
-		b.latency.update(s.P99Latency)
-		b.n++
+		if s.RequestRate > 0 {
+			b.errorRate.update(s.ErrorRate)
+			b.latency.update(s.P99Latency)
+			b.n++
+		}
 		return nil
+	}
+
+	// --- DB pool saturation ----------------------------------------------
+	// This is a threshold, not a z-score: a full pool is definitionally bad and
+	// is the strongest possible root-cause signal, so we always surface it.
+	// It is evaluated before the no-traffic guard below because the pool is an
+	// instantaneous gauge rather than an interval aggregate — and a fully
+	// exhausted pool is precisely the case where requests block long enough that
+	// none complete within a scrape interval. Gating it on traffic would blind
+	// the platform to pool exhaustion exactly when it matters most.
+	if util := s.DBUtilization(); util >= d.cfg.DBUtilThreshold {
+		out = append(out, Anomaly{
+			Service:  s.Service,
+			Kind:     KindDBPool,
+			Value:    util,
+			Baseline: d.cfg.DBUtilThreshold,
+			Score:    math.Inf(1),
+			Detail: fmt.Sprintf("DB connection pool %d/%d in use (%.0f%%)",
+				s.DBInUse, s.DBMax, util*100),
+			Snapshot: s,
+		})
+	}
+
+	// An interval in which the service completed no requests carries no latency
+	// or error-rate information: the scraper reports p99=0 and errorRate=0
+	// because nothing was measured, not because the service was fast and
+	// healthy. Feeding those zeros into the baselines drags them far below the
+	// service's true normal, and once real traffic arrives every sample then
+	// looks like a huge multiple of that floor-level baseline. Because an
+	// anomalous sample is also not learned from, the bad baseline can never
+	// recover and the service stays anomalous forever — which is what prevented
+	// incidents from auto-resolving. Skipping empty intervals keeps baselines
+	// representative.
+	if s.RequestRate <= 0 {
+		return out
 	}
 
 	// --- Error rate -------------------------------------------------------
@@ -122,9 +173,13 @@ func (d *Detector) Observe(s model.ServiceSnapshot) []Anomaly {
 
 	// --- p99 latency ------------------------------------------------------
 	latZ := b.latency.z(s.P99Latency)
-	// Require both a statistical spike and a meaningful absolute multiple so a
-	// 2ms->6ms blip on a fast service doesn't alarm.
-	latAnom := latZ >= d.cfg.ZThreshold && b.latency.mean > 0 && s.P99Latency >= 2*b.latency.mean
+	// Three gates, all required: an absolute floor (so bucket-quantization noise
+	// on a fast service can never alarm), a statistical spike, and a meaningful
+	// multiple of the service's own baseline.
+	latAnom := s.P99Latency >= d.cfg.LatencyFloor &&
+		latZ >= d.cfg.ZThreshold &&
+		b.latency.mean > 0 &&
+		s.P99Latency >= 2*b.latency.mean
 	if latAnom {
 		pct := 0.0
 		if b.latency.mean > 0 {
@@ -142,24 +197,12 @@ func (d *Detector) Observe(s model.ServiceSnapshot) []Anomaly {
 		})
 	}
 
-	// --- DB pool saturation ----------------------------------------------
-	// This is a threshold, not a z-score: a full pool is definitionally bad and
-	// is the strongest possible root-cause signal, so we always surface it.
-	if util := s.DBUtilization(); util >= d.cfg.DBUtilThreshold {
-		out = append(out, Anomaly{
-			Service:  s.Service,
-			Kind:     KindDBPool,
-			Value:    util,
-			Baseline: d.cfg.DBUtilThreshold,
-			Score:    math.Inf(1),
-			Detail: fmt.Sprintf("DB connection pool %d/%d in use (%.0f%%)",
-				s.DBInUse, s.DBMax, util*100),
-			Snapshot: s,
-		})
-	}
-
 	// Only update baselines when the service looks healthy, so an ongoing
-	// incident doesn't drag the baseline up to meet it.
+	// incident doesn't drag the baseline up to meet it. The freeze is deliberately
+	// all-or-nothing: while a service is in a bad state every baseline stays
+	// pinned to what normal looked like before it, so a second signal degrading
+	// mid-incident is still measured against healthy normal rather than being
+	// quietly absorbed.
 	if !errAnom && !latAnom {
 		b.errorRate.update(s.ErrorRate)
 		b.latency.update(s.P99Latency)
