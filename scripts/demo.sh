@@ -1,49 +1,146 @@
 #!/usr/bin/env bash
-# Inject the signature failure and print the incident the platform produces.
-# Works against either the docker-compose stack or a local run — both expose the
-# Payment chaos endpoint on :8083 and the platform on :8080.
-set -euo pipefail
+# Inject Payment pool exhaustion, wait for diagnosis, then verify recovery.
+set -Eeuo pipefail
 
 PLATFORM="${PLATFORM_URL:-http://localhost:8080}"
 PAYMENT="${PAYMENT_URL:-http://localhost:8083}"
 HOLDERS="${HOLDERS:-10}"
 DURATION="${DURATION:-45s}"
+DIAGNOSIS_TIMEOUT="${DIAGNOSIS_TIMEOUT:-60}"
+RECOVERY_TIMEOUT="${RECOVERY_TIMEOUT:-120}"
 
-echo "▶ Injecting DB connection-pool exhaustion on payment-service"
-echo "  (${HOLDERS} held connections for ${DURATION})"
-curl -s -X POST "${PAYMENT}/chaos/db-pool-exhaust?holders=${HOLDERS}&duration=${DURATION}" >/dev/null
-echo "  injected. Watch the dashboard at ${PLATFORM}"
+# Verify the endpoints before changing application state.
+curl -fsS "$PLATFORM/api/incidents" >/dev/null
+curl -fsS "$PAYMENT/chaos/status" >/dev/null
+
+# Record existing IDs so old incidents cannot satisfy this demo.
+BASELINE_IDS="$(
+  curl -fsS "$PLATFORM/api/incidents" |
+    python3 -c '
+import json, sys
+print(",".join(i["id"] for i in json.load(sys.stdin)))
+'
+)"
+export BASELINE_IDS
+
+echo "== AI-powered-DIRP cloud demo =="
+echo "Platform: $PLATFORM"
+echo "Payment:  $PAYMENT"
+echo "Fault:    $HOLDERS connections for $DURATION"
 echo
 
-echo "⏳ Waiting for the detection + analysis pipeline…"
-for i in $(seq 1 20); do
-  sleep 2
-  body="$(curl -s "${PLATFORM}/api/incidents" || true)"
-  if echo "$body" | grep -q '"root_cause"' && echo "$body" | grep -q '"service"'; then
-    echo
-    echo "🚨 INCIDENT DIAGNOSED:"
-    echo "$body" | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-if not d:
-    sys.exit()
-i = d[0]
-rc = i.get("root_cause") or {}
-print("  {}  severity={}  status={}".format(i["id"], i["severity"], i["status"]))
-print("  affected: {}".format(i["affected_service"]))
-print("  evidence:")
-for e in i.get("evidence", []):
-    print("    - [{}] {}".format(e["service"], e["detail"]))
-print("  root cause: {}  (source={}, confidence={})".format(
-    rc.get("service"), rc.get("source"), rc.get("confidence")))
-print("    {}".format(rc.get("summary")))
-print("  remediation:")
-for r in (rc.get("remediation") or []):
-    print("    - {}".format(r))
+echo "Injecting connection-pool exhaustion..."
+curl -fsS -X POST \
+  "$PAYMENT/chaos/db-pool-exhaust?holders=${HOLDERS}&duration=${DURATION}"
+echo
+echo "Fault injected. Waiting for a NEW incident diagnosis..."
+
+INCIDENT=""
+for ((elapsed=0; elapsed<DIAGNOSIS_TIMEOUT; elapsed+=2)); do
+  BODY="$(curl -fsS "$PLATFORM/api/incidents")"
+
+  INCIDENT="$(
+    printf '%s' "$BODY" |
+      python3 -c '
+import json, os, sys
+before = set(filter(None, os.environ["BASELINE_IDS"].split(",")))
+incidents = json.load(sys.stdin)
+for i in incidents:
+    rc = i.get("root_cause")
+    if i.get("id") not in before and isinstance(rc, dict) and rc.get("service"):
+        print(json.dumps(i))
+        break
 '
-    exit 0
+  )"
+
+  if [[ -n "$INCIDENT" ]]; then
+    break
   fi
+
+  sleep 2
 done
 
-echo "No incident detected yet — is the stack warmed up (needs ~15s of baseline traffic)?"
-exit 1
+if [[ -z "$INCIDENT" ]]; then
+  echo "ERROR: No new incident with a completed root-cause diagnosis."
+  echo "Inspect: docker compose -f docker-compose.cloud.yml logs --tail=100 platform"
+  exit 1
+fi
+
+INCIDENT_ID="$(
+  printf '%s' "$INCIDENT" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+)"
+ROOT_SERVICE="$(
+  printf '%s' "$INCIDENT" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["root_cause"]["service"])'
+)"
+
+echo
+echo "== INCIDENT DIAGNOSED =="
+printf '%s' "$INCIDENT" | python3 -c '
+import json, sys
+i = json.load(sys.stdin)
+rc = i["root_cause"]
+print("ID:          ", i["id"])
+print("Severity:    ", i.get("severity"))
+print("Status:      ", i.get("status"))
+print("Affected:    ", i.get("affected_service"))
+print("Evidence:")
+for e in i.get("evidence") or []:
+    print("  - [{}] {}".format(e.get("service"), e.get("detail")))
+print("Root cause:  ", rc["service"])
+print("Confidence:  ", rc.get("confidence"))
+print("Source:      ", rc.get("source"))
+print("Summary:     ", rc.get("summary"))
+print("Remediation:")
+for r in rc.get("remediation") or []:
+    print("  -", r)
+'
+
+if [[ "$ROOT_SERVICE" != "payment-service" ]]; then
+  echo
+  echo "WARNING: Expected payment-service; got $ROOT_SERVICE."
+  ROOT_CAUSE_CORRECT=0
+else
+  echo
+  echo "PASS: Correct root cause identified: payment-service."
+  ROOT_CAUSE_CORRECT=1
+fi
+
+echo
+echo "Waiting for incident $INCIDENT_ID to resolve..."
+RESOLVED=0
+
+for ((elapsed=0; elapsed<RECOVERY_TIMEOUT; elapsed+=2)); do
+  STATUS="$(
+    curl -fsS "$PLATFORM/api/incidents/$INCIDENT_ID" |
+      python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("status", ""))
+' 2>/dev/null || true
+  )"
+
+  if [[ "$STATUS" == "resolved" ]]; then
+    RESOLVED=1
+    break
+  fi
+
+  sleep 2
+done
+
+if [[ "$RESOLVED" -ne 1 ]]; then
+  echo "ERROR: Incident did not resolve within ${RECOVERY_TIMEOUT}s."
+  echo "Current status: ${STATUS:-unknown}"
+  exit 1
+fi
+
+echo "PASS: Incident $INCIDENT_ID resolved."
+
+if [[ "$ROOT_CAUSE_CORRECT" -ne 1 ]]; then
+  echo "FAIL: Recovery succeeded, but the root cause was incorrect."
+  exit 2
+fi
+
+echo
+echo "SUCCESS: Fault detected, correct root cause identified, and incident resolved."
+EOF
