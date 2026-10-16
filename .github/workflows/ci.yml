@@ -49,3 +49,53 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Configure known hosts
+        env:
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy image to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -eu
+
+          ssh "$EC2_USER@$EC2_HOST" \
+            "set -eu
+             cd '$EC2_APP_DIR'
+             DIRP_IMAGE_TAG='$IMAGE_TAG' \
+               docker compose -f docker-compose.cloud.yml pull
+             DIRP_IMAGE_TAG='$IMAGE_TAG' \
+               docker compose -f docker-compose.cloud.yml up -d --remove-orphans
+
+             for i in \$(seq 1 30); do
+               if curl -fsS http://127.0.0.1:8080/api/services >/dev/null; then
+                 echo 'Platform API is responding'
+                 exit 0
+               fi
+               sleep 2
+             done
+
+             docker compose -f docker-compose.cloud.yml logs --tail=100 platform
+             exit 1"

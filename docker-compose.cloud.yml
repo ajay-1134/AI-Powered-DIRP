@@ -6,7 +6,7 @@
 #   ./scripts/demo.sh
 
 x-dirp: &dirp
-  image: ghcr.io/ajay-1134/ai-powered-dirp:latest
+  image: ghcr.io/ajay-1134/ai-powered-dirp:${DIRP_IMAGE_TAG:-latest}
   restart: unless-stopped
 
 services:
