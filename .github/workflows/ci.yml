@@ -50,12 +50,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
   deploy:
     name: Deploy to EC2
     needs: image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      contents: read
 
     steps:
       - name: Configure SSH
@@ -67,6 +70,7 @@ jobs:
         env:
           KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
+          set -eu
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
@@ -82,20 +86,26 @@ jobs:
           set -eu
 
           ssh "$EC2_USER@$EC2_HOST" \
-            "set -eu
-             cd '$EC2_APP_DIR'
-             DIRP_IMAGE_TAG='$IMAGE_TAG' \
-               docker compose -f docker-compose.cloud.yml pull
-             DIRP_IMAGE_TAG='$IMAGE_TAG' \
-               docker compose -f docker-compose.cloud.yml up -d --remove-orphans
+            "EC2_APP_DIR='$EC2_APP_DIR' DIRP_IMAGE_TAG='$IMAGE_TAG' bash -s" <<'REMOTE'
+          set -eu
 
-             for i in \$(seq 1 30); do
-               if curl -fsS http://127.0.0.1:8080/api/services >/dev/null; then
-                 echo 'Platform API is responding'
-                 exit 0
-               fi
-               sleep 2
-             done
+          cd "$EC2_APP_DIR"
 
-             docker compose -f docker-compose.cloud.yml logs --tail=100 platform
-             exit 1"
+          DIRP_IMAGE_TAG="$DIRP_IMAGE_TAG" \
+            docker compose -f docker-compose.cloud.yml pull
+
+          DIRP_IMAGE_TAG="$DIRP_IMAGE_TAG" \
+            docker compose -f docker-compose.cloud.yml up -d --remove-orphans
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/services >/dev/null; then
+              echo "Platform API is responding"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker compose -f docker-compose.cloud.yml logs --tail=100
+          echo "Deployment health check failed"
+          exit 1
+          REMOTE
